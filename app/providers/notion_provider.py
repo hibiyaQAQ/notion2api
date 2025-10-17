@@ -221,32 +221,36 @@ class NotionAIProvider(BaseProvider):
             raise NotionRequestError(f"处理请求失败: {str(e)}")
 
     async def _stream_chat_completion(self, request_data: Dict[str, Any], model_name: str) -> StreamingResponse:
-        """流式聊天完成"""
+        """流式聊天完成 - 真实增量输出"""
 
         async def stream_generator() -> AsyncGenerator[bytes, None]:
             request_id = f"chatcmpl-{uuid.uuid4()}"
-            incremental_fragments: List[str] = []
-            final_message: Optional[str] = None
+
+            # 控制是否返回思考内容
+            include_reasoning = request_data.get("include_reasoning", False)
 
             try:
                 mapped_model = settings.MODEL_MAP.get(model_name, "anthropic-sonnet-alt")
-
                 thread_type = "markdown-chat" if mapped_model.startswith("vertex-") else "workflow"
 
                 thread_id = await self._create_thread(thread_type)
                 payload = self._prepare_payload(request_data, thread_id, mapped_model, thread_type)
                 headers = self._prepare_headers()
 
+                # 立即返回 role chunk
                 role_chunk = create_chat_completion_chunk(request_id, model_name, role="assistant")
                 yield create_sse_data(role_chunk)
 
                 def sync_stream_iterator():
                     try:
                         logger.info(f"请求 Notion AI URL: {self.api_endpoints['runInference']}")
-                        logger.info(f"请求体: {json.dumps(payload, indent=2, ensure_ascii=False)}")
+                        logger.debug(f"请求体: {json.dumps(payload, indent=2, ensure_ascii=False)}")
 
                         response = self.scraper.post(
-                            self.api_endpoints['runInference'], headers=headers, json=payload, stream=True,
+                            self.api_endpoints['runInference'],
+                            headers=headers,
+                            json=payload,
+                            stream=True,
                             timeout=settings.API_REQUEST_TIMEOUT
                         )
                         response.raise_for_status()
@@ -258,6 +262,12 @@ class NotionAIProvider(BaseProvider):
 
                 sync_gen = sync_stream_iterator()
 
+                # 用于跟踪已发送的内容（避免重复）
+                sent_content_length = 0
+                accumulated_content = ""
+                reasoning_content = ""
+                has_sent_reasoning = False
+
                 while True:
                     line = await run_in_threadpool(lambda: next(sync_gen, None))
                     if line is None:
@@ -266,28 +276,51 @@ class NotionAIProvider(BaseProvider):
                         raise line
 
                     parsed_results = self._parse_ndjson_line_to_texts(line)
+
                     for text_type, content in parsed_results:
                         if text_type == 'final':
-                            final_message = content
+                            # 最终消息，包含完整内容
+                            accumulated_content = content
                         elif text_type == 'incremental':
-                            incremental_fragments.append(content)
+                            # 增量内容
+                            accumulated_content += content
+                        elif text_type == 'thinking':
+                            # 思考内容
+                            reasoning_content += content
+                            if include_reasoning and not has_sent_reasoning and reasoning_content:
+                                # 发送思考内容（作为单独的消息）
+                                reasoning_chunk = {
+                                    "id": request_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": model_name,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "reasoning_content": reasoning_content
+                                        },
+                                        "finish_reason": None
+                                    }]
+                                }
+                                yield create_sse_data(reasoning_chunk)
+                                has_sent_reasoning = True
 
-                full_response = ""
-                if final_message:
-                    full_response = final_message
-                    logger.info(f"成功从 record-map 或 Gemini patch/event 中提取到最终消息。")
-                else:
-                    full_response = "".join(incremental_fragments)
-                    logger.info(f"使用拼接所有增量片段的方式获得最终消息。")
+                    # 实时增量发送新内容
+                    if len(accumulated_content) > sent_content_length:
+                        new_content = accumulated_content[sent_content_length:]
+                        # 清洗新内容（但保留思考标签供后续处理）
+                        cleaned_new_content = self._clean_content_incremental(new_content)
 
-                if full_response:
-                    cleaned_response = self._clean_content(full_response)
-                    logger.info(f"清洗后的最终响应: {cleaned_response}")
-                    chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_response)
-                    yield create_sse_data(chunk)
-                else:
-                    logger.warning("警告: Notion 返回的数据流中未提取到任何有效文本。请检查您的 .env 配置是否全部正确且凭证有效。")
+                        if cleaned_new_content:
+                            chunk = create_chat_completion_chunk(
+                                request_id,
+                                model_name,
+                                content=cleaned_new_content
+                            )
+                            yield create_sse_data(chunk)
+                            sent_content_length = len(accumulated_content)
 
+                # 发送完成标志
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
                 yield create_sse_data(final_chunk)
                 yield DONE_CHUNK
@@ -433,7 +466,44 @@ class NotionAIProvider(BaseProvider):
 
         return content.strip()
 
+    def _clean_content_incremental(self, content: str) -> str:
+        """清洗增量内容 - 用于流式输出，保守清洗避免破坏未完成的内容"""
+        if not content:
+            return ""
+
+        # 只移除明显的语言标记
+        content = re.sub(r'<lang primary="[^"]*"\s*/>\n*', '', content)
+
+        # 对于思考标签，如果是完整的则移除，否则保留（可能还在传输中）
+        if '<thinking>' in content.lower() and '</thinking>' in content.lower():
+            content = re.sub(r'<thinking>[\s\S]*?</thinking>\s*', '', content, flags=re.IGNORECASE)
+        if '<thought>' in content.lower() and '</thought>' in content.lower():
+            content = re.sub(r'<thought>[\s\S]*?</thought>\s*', '', content, flags=re.IGNORECASE)
+
+        return content
+
+    def _extract_thinking_content(self, content: str) -> str:
+        """提取思考内容"""
+        thinking_parts = []
+
+        # 提取 <thinking> 标签内容
+        thinking_matches = re.findall(r'<thinking>([\s\S]*?)</thinking>', content, flags=re.IGNORECASE)
+        thinking_parts.extend(thinking_matches)
+
+        # 提取 <thought> 标签内容
+        thought_matches = re.findall(r'<thought>([\s\S]*?)</thought>', content, flags=re.IGNORECASE)
+        thinking_parts.extend(thought_matches)
+
+        return '\n'.join(thinking_parts).strip()
+
     def _parse_ndjson_line_to_texts(self, line: bytes) -> List[Tuple[str, str]]:
+        """解析 NDJSON 行，返回 (类型, 内容) 元组列表
+
+        类型可以是:
+        - 'final': 完整的最终内容
+        - 'incremental': 增量内容片段
+        - 'thinking': 思考/推理内容
+        """
         results: List[Tuple[str, str]] = []
         try:
             s = line.decode("utf-8", errors="ignore").strip()
@@ -446,7 +516,11 @@ class NotionAIProvider(BaseProvider):
             if data.get("type") == "markdown-chat":
                 content = data.get("value", "")
                 if content:
-                    logger.info("从 'markdown-chat' 直接事件中提取到内容。")
+                    logger.debug("从 'markdown-chat' 直接事件中提取到内容。")
+                    # 提取思考内容
+                    thinking = self._extract_thinking_content(content)
+                    if thinking:
+                        results.append(('thinking', thinking))
                     results.append(('final', content))
 
             # 格式2: Claude 和 GPT 返回的补丁流，以及 Gemini 的 patch 格式
@@ -458,32 +532,46 @@ class NotionAIProvider(BaseProvider):
                     path = operation.get("p", "")
                     value = operation.get("v")
 
-                    # 【修改】Gemini 的完整内容 patch 格式
+                    # Gemini 的完整内容 patch 格式
                     if op_type == "a" and path.endswith("/s/-") and isinstance(value, dict) and value.get("type") == "markdown-chat":
                         content = value.get("value", "")
                         if content:
-                            logger.info("从 'patch' (Gemini-style) 中提取到完整内容。")
+                            logger.debug("从 'patch' (Gemini-style) 中提取到完整内容。")
+                            # 提取思考内容
+                            thinking = self._extract_thinking_content(content)
+                            if thinking:
+                                results.append(('thinking', thinking))
                             results.append(('final', content))
 
-                    # 【修改】Gemini 的增量内容 patch 格式
+                    # Gemini 的增量内容 patch 格式
                     elif op_type == "x" and "/s/" in path and path.endswith("/value") and isinstance(value, str):
                         content = value
                         if content:
-                            logger.info(f"从 'patch' (Gemini增量) 中提取到内容: {content}")
+                            logger.debug(f"从 'patch' (Gemini增量) 中提取到内容片段")
+                            # 增量内容也可能包含思考标签
+                            thinking = self._extract_thinking_content(content)
+                            if thinking:
+                                results.append(('thinking', thinking))
                             results.append(('incremental', content))
 
-                    # 【修改】Claude 和 GPT 的增量内容 patch 格式
+                    # Claude 和 GPT 的增量内容 patch 格式
                     elif op_type == "x" and "/value/" in path and isinstance(value, str):
                         content = value
                         if content:
-                            logger.info(f"从 'patch' (Claude/GPT增量) 中提取到内容: {content}")
+                            logger.debug(f"从 'patch' (Claude/GPT增量) 中提取到内容片段")
+                            thinking = self._extract_thinking_content(content)
+                            if thinking:
+                                results.append(('thinking', thinking))
                             results.append(('incremental', content))
 
-                    # 【修改】Claude 和 GPT 的完整内容 patch 格式
+                    # Claude 和 GPT 的完整内容 patch 格式
                     elif op_type == "a" and path.endswith("/value/-") and isinstance(value, dict) and value.get("type") == "text":
                         content = value.get("content", "")
                         if content:
-                            logger.info("从 'patch' (Claude/GPT-style) 中提取到完整内容。")
+                            logger.debug("从 'patch' (Claude/GPT-style) 中提取到完整内容。")
+                            thinking = self._extract_thinking_content(content)
+                            if thinking:
+                                results.append(('thinking', thinking))
                             results.append(('final', content))
 
             # 格式3: 处理record-map类型的数据
@@ -509,7 +597,10 @@ class NotionAIProvider(BaseProvider):
                                         break
 
                         if content and isinstance(content, str):
-                            logger.info(f"从 record-map (type: {step_type}) 提取到最终内容。")
+                            logger.debug(f"从 record-map (type: {step_type}) 提取到最终内容。")
+                            thinking = self._extract_thinking_content(content)
+                            if thinking:
+                                results.append(('thinking', thinking))
                             results.append(('final', content))
                             break
 
@@ -527,4 +618,3 @@ class NotionAIProvider(BaseProvider):
             ]
         }
         return JSONResponse(content=model_data)
-

@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     )
 
     APP_NAME: str = "notion-2api"
-    APP_VERSION: str = "4.0.1" # 改进版
+    APP_VERSION: str = "4.0.2" # 流式和思考内容改进版
     DESCRIPTION: str = "一个将 Notion AI 转换为兼容 OpenAI 格式 API 的高性能代理。"
 
     # 日志配置
@@ -29,7 +29,9 @@ class Settings(BaseSettings):
     NOTION_BLOCK_ID: Optional[str] = None
     NOTION_CLIENT_VERSION: Optional[str] = "23.13.20251011.2037"
 
-    API_REQUEST_TIMEOUT: int = 180
+    # 超时配置（秒）
+    API_REQUEST_TIMEOUT: int = 300  # 从 180 增加到 300 秒（5分钟）
+    STREAM_READ_TIMEOUT: int = 600  # 流式读取总超时（10分钟）
     NGINX_PORT: int = 8088
 
     # 速率限制配置
