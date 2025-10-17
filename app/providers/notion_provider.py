@@ -189,7 +189,12 @@ class NotionAIProvider(BaseProvider):
                 logger.warning("Notion 未返回任何内容")
                 full_content = ""
 
-            cleaned_content = self._clean_content(full_content)
+            # include_reasoning 控制是否移除思考内容
+            include_reasoning = request_data.get("include_reasoning", False)
+            remove_thinking = not include_reasoning
+            cleaned_content = self._clean_content(full_content, remove_thinking=remove_thinking)
+
+            logger.info(f"非流式请求完成，include_reasoning={include_reasoning}, 清洗后内容长度={len(cleaned_content)}")
 
             # 返回标准 OpenAI 格式响应
             response_data = {
@@ -313,23 +318,34 @@ class NotionAIProvider(BaseProvider):
 
                     # 实时增量发送新内容
                     if len(accumulated_content) > sent_content_length:
-                        new_content = accumulated_content[sent_content_length:]
-                        logger.debug(f"[流式处理] 准备发送新内容，原始长度={len(new_content)}")
+                        # 关键改变：对累积的完整内容进行清洗，然后只发送新增的部分
+                        # include_reasoning 控制是否移除思考内容
+                        remove_thinking = not include_reasoning
+                        cleaned_full_content = self._clean_content(accumulated_content, remove_thinking=remove_thinking)
 
-                        # 清洗新内容（但保留思考标签供后续处理）
-                        cleaned_new_content = self._clean_content_incremental(new_content)
-                        logger.debug(f"[流式处理] 清洗后内容长度={len(cleaned_new_content)}")
+                        # 计算已发送的清洗后内容长度（通过清洗之前发送的部分）
+                        if sent_content_length > 0:
+                            cleaned_sent_content = self._clean_content(accumulated_content[:sent_content_length], remove_thinking=remove_thinking)
+                            cleaned_sent_length = len(cleaned_sent_content)
+                        else:
+                            cleaned_sent_length = 0
 
-                        if cleaned_new_content:
-                            logger.info(f"[发送给客户端] 内容: {cleaned_new_content[:100]}...")
-                            chunk = create_chat_completion_chunk(
-                                request_id,
-                                model_name,
-                                content=cleaned_new_content
-                            )
-                            yield create_sse_data(chunk)
-                            sent_content_length = len(accumulated_content)
-                            logger.debug(f"[流式处理] 已发送内容，更新已发送长度={sent_content_length}")
+                        # 提取新的清洗后内容
+                        if len(cleaned_full_content) > cleaned_sent_length:
+                            cleaned_new_content = cleaned_full_content[cleaned_sent_length:]
+                            logger.debug(f"[流式处理] 清洗后新内容长度={len(cleaned_new_content)}, 原始长度={len(accumulated_content) - sent_content_length}, remove_thinking={remove_thinking}")
+
+                            if cleaned_new_content:
+                                logger.info(f"[发送给客户端] 内容: {cleaned_new_content[:100]}...")
+                                chunk = create_chat_completion_chunk(
+                                    request_id,
+                                    model_name,
+                                    content=cleaned_new_content
+                                )
+                                yield create_sse_data(chunk)
+
+                        sent_content_length = len(accumulated_content)
+                        logger.debug(f"[流式处理] 更新已发送原始内容长度={sent_content_length}")
 
                 # 发送完成标志
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
@@ -458,22 +474,33 @@ class NotionAIProvider(BaseProvider):
 
         return payload
 
-    def _clean_content(self, content: str) -> str:
+    def _clean_content(self, content: str, remove_thinking: bool = True) -> str:
+        """完整清洗内容 - 移除特殊标记和思考内容
+
+        Args:
+            content: 要清洗的内容
+            remove_thinking: 是否移除思考内容（默认为 True）
+        """
         if not content:
             return ""
 
+        # 始终移除语言标记
         content = re.sub(r'<lang primary="[^"]*"\s*/>\n*', '', content)
+
+        # 始终移除 XML 思考标签
         content = re.sub(r'<thinking>[\s\S]*?</thinking>\s*', '', content, flags=re.IGNORECASE)
         content = re.sub(r'<thought>[\s\S]*?</thought>\s*', '', content, flags=re.IGNORECASE)
 
-        content = re.sub(r'^.*?Chinese whatmodel I am.*?Theyspecifically.*?requested.*?me.*?to.*?reply.*?in.*?Chinese\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?This.*?is.*?a.*?straightforward.*?question.*?about.*?my.*?identity.*?asan.*?AI.*?assistant\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?Idon\'t.*?need.*?to.*?use.*?any.*?tools.*?for.*?this.*?-\s*it\'s.*?asimple.*?informational.*?response.*?aboutwhat.*?I.*?am\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?Sincethe.*?user.*?asked.*?in.*?Chinese.*?and.*?specifically.*?requested.*?a.*?Chinese.*?response.*?I.*?should.*?respond.*?in.*?Chinese\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?What model are you.*?in Chinese and specifically requesting.*?me.*?to.*?reply.*?in.*?Chinese\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?This.*?is.*?a.*?question.*?about.*?my.*?identity.*?not requiring.*?any.*?tool.*?use.*?I.*?should.*?respond.*?directly.*?to.*?the.*?user.*?in.*?Chinese.*?as.*?requested\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?I.*?should.*?identify.*?myself.*?as.*?Notion.*?AI.*?as.*?mentioned.*?in.*?the.*?system.*?prompt.*?\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?I.*?should.*?not.*?make.*?specific.*?claims.*?about.*?the.*?underlying.*?model.*?architecture.*?since.*?that.*?information.*?is.*?not.*?provided.*?in.*?my.*?context\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
+        # 只有在 remove_thinking=True 时才移除思考内容模式
+        if remove_thinking:
+            content = re.sub(r'^.*?Chinese whatmodel I am.*?Theyspecifically.*?requested.*?me.*?to.*?reply.*?in.*?Chinese\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
+            content = re.sub(r'^.*?This.*?is.*?a.*?straightforward.*?question.*?about.*?my.*?identity.*?asan.*?AI.*?assistant\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
+            content = re.sub(r'^.*?Idon\'t.*?need.*?to.*?use.*?any.*?tools.*?for.*?this.*?-\s*it\'s.*?asimple.*?informational.*?response.*?aboutwhat.*?I.*?am\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
+            content = re.sub(r'^.*?Sincethe.*?user.*?asked.*?in.*?Chinese.*?and.*?specifically.*?requested.*?a.*?Chinese.*?response.*?I.*?should.*?respond.*?in.*?Chinese\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
+            content = re.sub(r'^.*?What model are you.*?in Chinese and specifically requesting.*?me.*?to.*?reply.*?in.*?Chinese\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
+            content = re.sub(r'^.*?This.*?is.*?a.*?question.*?about.*?my.*?identity.*?not requiring.*?any.*?tool.*?use.*?I.*?should.*?respond.*?directly.*?to.*?the.*?user.*?in.*?Chinese.*?as.*?requested\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
+            content = re.sub(r'^.*?I.*?should.*?identify.*?myself.*?as.*?Notion.*?AI.*?as.*?mentioned.*?in.*?the.*?system.*?prompt.*?\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
+            content = re.sub(r'^.*?I.*?should.*?not.*?make.*?specific.*?claims.*?about.*?the.*?underlying.*?model.*?architecture.*?since.*?that.*?information.*?is.*?not.*?provided.*?in.*?my.*?context\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
 
         return content.strip()
 
