@@ -1,0 +1,22 @@
+# requirements.txt
+# Web 框架
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# HTTP 客户端
+httpx>=0.25.0
+cloudscraper>=1.2.71
+
+# 配置管理
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
+
+# 速率限制
+slowapi>=0.1.9
+
+# 重试机制 (可选,用于后续改进)
+tenacity>=8.2.3
+
+# 测试依赖 (开发环境)
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
