@@ -278,15 +278,20 @@ class NotionAIProvider(BaseProvider):
                     parsed_results = self._parse_ndjson_line_to_texts(line)
 
                     for text_type, content in parsed_results:
+                        logger.debug(f"[流式处理] 收到类型={text_type}, 内容长度={len(content)}")
+
                         if text_type == 'final':
                             # 最终消息，包含完整内容
                             accumulated_content = content
+                            logger.debug(f"[流式处理] 累积内容更新为完整内容，长度={len(accumulated_content)}")
                         elif text_type == 'incremental':
                             # 增量内容
                             accumulated_content += content
+                            logger.debug(f"[流式处理] 累积内容增加，新长度={len(accumulated_content)}")
                         elif text_type == 'thinking':
                             # 思考内容
                             reasoning_content += content
+                            logger.debug(f"[流式处理] 思考内容累积，长度={len(reasoning_content)}, include_reasoning={include_reasoning}")
                             if include_reasoning and not has_sent_reasoning and reasoning_content:
                                 # 发送思考内容（作为单独的消息）
                                 reasoning_chunk = {
@@ -302,16 +307,21 @@ class NotionAIProvider(BaseProvider):
                                         "finish_reason": None
                                     }]
                                 }
+                                logger.info(f"[流式处理] 发送思考内容块，长度={len(reasoning_content)}")
                                 yield create_sse_data(reasoning_chunk)
                                 has_sent_reasoning = True
 
                     # 实时增量发送新内容
                     if len(accumulated_content) > sent_content_length:
                         new_content = accumulated_content[sent_content_length:]
+                        logger.debug(f"[流式处理] 准备发送新内容，原始长度={len(new_content)}")
+
                         # 清洗新内容（但保留思考标签供后续处理）
                         cleaned_new_content = self._clean_content_incremental(new_content)
+                        logger.debug(f"[流式处理] 清洗后内容长度={len(cleaned_new_content)}")
 
                         if cleaned_new_content:
+                            logger.info(f"[发送给客户端] 内容: {cleaned_new_content[:100]}...")
                             chunk = create_chat_completion_chunk(
                                 request_id,
                                 model_name,
@@ -319,6 +329,7 @@ class NotionAIProvider(BaseProvider):
                             )
                             yield create_sse_data(chunk)
                             sent_content_length = len(accumulated_content)
+                            logger.debug(f"[流式处理] 已发送内容，更新已发送长度={sent_content_length}")
 
                 # 发送完成标志
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
@@ -471,14 +482,31 @@ class NotionAIProvider(BaseProvider):
         if not content:
             return ""
 
+        original_content = content
+        logger.debug(f"[内容清洗] 原始内容: {content[:200]}")
+
         # 只移除明显的语言标记
         content = re.sub(r'<lang primary="[^"]*"\s*/>\n*', '', content)
 
         # 对于思考标签，如果是完整的则移除，否则保留（可能还在传输中）
+        has_thinking = '<thinking>' in content.lower() or '<thought>' in content.lower()
+        has_thinking_end = '</thinking>' in content.lower() or '</thought>' in content.lower()
+
+        logger.debug(f"[内容清洗] 检测到思考标签: has_thinking={has_thinking}, has_thinking_end={has_thinking_end}")
+
         if '<thinking>' in content.lower() and '</thinking>' in content.lower():
+            before_len = len(content)
             content = re.sub(r'<thinking>[\s\S]*?</thinking>\s*', '', content, flags=re.IGNORECASE)
+            logger.debug(f"[内容清洗] 移除了 <thinking> 标签，长度 {before_len} -> {len(content)}")
         if '<thought>' in content.lower() and '</thought>' in content.lower():
+            before_len = len(content)
             content = re.sub(r'<thought>[\s\S]*?</thought>\s*', '', content, flags=re.IGNORECASE)
+            logger.debug(f"[内容清洗] 移除了 <thought> 标签，长度 {before_len} -> {len(content)}")
+
+        if original_content != content:
+            logger.debug(f"[内容清洗] 清洗后内容: {content[:200]}")
+        else:
+            logger.debug(f"[内容清洗] 内容未改变")
 
         return content
 
@@ -510,7 +538,12 @@ class NotionAIProvider(BaseProvider):
             if not s: return results
 
             data = json.loads(s)
-            logger.debug(f"原始响应数据: {json.dumps(data, ensure_ascii=False)}")
+
+            # 详细调试日志 - 输出完整的原始响应
+            logger.debug("="*80)
+            logger.debug(f"原始响应类型: {data.get('type')}")
+            logger.debug(f"完整原始响应数据:\n{json.dumps(data, ensure_ascii=False, indent=2)}")
+            logger.debug("="*80)
 
             # 格式1: Gemini 返回的 markdown-chat 事件
             if data.get("type") == "markdown-chat":
@@ -606,6 +639,13 @@ class NotionAIProvider(BaseProvider):
 
         except (json.JSONDecodeError, AttributeError) as e:
             logger.warning(f"解析NDJSON行失败: {e} - Line: {line.decode('utf-8', errors='ignore')}")
+
+        # 输出解析结果的详细信息
+        if results:
+            logger.debug(f"本次解析得到 {len(results)} 个结果:")
+            for idx, (text_type, content) in enumerate(results):
+                preview = content[:200] if len(content) > 200 else content
+                logger.debug(f"  [{idx}] 类型={text_type}, 内容长度={len(content)}, 预览: {preview}")
 
         return results
 
