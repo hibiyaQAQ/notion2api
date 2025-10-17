@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     )
 
     APP_NAME: str = "notion-2api"
-    APP_VERSION: str = "4.0.3"  # 修复思考内容过滤问题
+    APP_VERSION: str = "4.1.0"  # 正确实现思考内容分离（基于 type 字段）
     DESCRIPTION: str = "一个将 Notion AI 转换为兼容 OpenAI 格式 API 的高性能代理。"
 
     # 日志配置

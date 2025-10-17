@@ -170,12 +170,15 @@ class NotionAIProvider(BaseProvider):
             lines = await run_in_threadpool(sync_request)
 
             incremental_fragments = []
+            thinking_fragments = []
             final_message = None
 
             for line in lines:
                 parsed_results = self._parse_ndjson_line_to_texts(line)
                 for text_type, content in parsed_results:
-                    if text_type == 'final':
+                    if text_type == 'thinking':
+                        thinking_fragments.append(content)
+                    elif text_type == 'final':
                         final_message = content
                     elif text_type == 'incremental':
                         incremental_fragments.append(content)
@@ -189,12 +192,18 @@ class NotionAIProvider(BaseProvider):
                 logger.warning("Notion 未返回任何内容")
                 full_content = ""
 
-            # include_reasoning 控制是否移除思考内容
+            # include_reasoning 控制是否包含思考内容
             include_reasoning = request_data.get("include_reasoning", False)
-            remove_thinking = not include_reasoning
-            cleaned_content = self._clean_content(full_content, remove_thinking=remove_thinking)
 
-            logger.info(f"非流式请求完成，include_reasoning={include_reasoning}, 清洗后内容长度={len(cleaned_content)}")
+            if include_reasoning and thinking_fragments:
+                # 如果需要包含思考内容，将其添加到回答前面
+                thinking_content = "".join(thinking_fragments)
+                final_content = thinking_content + full_content
+                logger.info(f"非流式请求完成，include_reasoning=True, 思考内容长度={len(thinking_content)}, 回答长度={len(full_content)}")
+            else:
+                # 否则只返回回答内容
+                final_content = full_content
+                logger.info(f"非流式请求完成，include_reasoning=False, 回答长度={len(full_content)}")
 
             # 返回标准 OpenAI 格式响应
             response_data = {
@@ -206,7 +215,7 @@ class NotionAIProvider(BaseProvider):
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": cleaned_content
+                        "content": final_content
                     },
                     "finish_reason": "stop"
                 }],
@@ -267,11 +276,10 @@ class NotionAIProvider(BaseProvider):
 
                 sync_gen = sync_stream_iterator()
 
-                # 用于跟踪已发送的内容（避免重复）
+                # 用于跟踪已发送的内容
                 sent_content_length = 0
-                accumulated_content = ""
-                reasoning_content = ""
-                has_sent_reasoning = False
+                accumulated_content = ""  # 只累积 text 类型的内容
+                accumulated_thinking = ""  # 累积 thinking 类型的内容
 
                 while True:
                     line = await run_in_threadpool(lambda: next(sync_gen, None))
@@ -285,20 +293,13 @@ class NotionAIProvider(BaseProvider):
                     for text_type, content in parsed_results:
                         logger.debug(f"[流式处理] 收到类型={text_type}, 内容长度={len(content)}")
 
-                        if text_type == 'final':
-                            # 最终消息，包含完整内容
-                            accumulated_content = content
-                            logger.debug(f"[流式处理] 累积内容更新为完整内容，长度={len(accumulated_content)}")
-                        elif text_type == 'incremental':
-                            # 增量内容
-                            accumulated_content += content
-                            logger.debug(f"[流式处理] 累积内容增加，新长度={len(accumulated_content)}")
-                        elif text_type == 'thinking':
-                            # 思考内容
-                            reasoning_content += content
-                            logger.debug(f"[流式处理] 思考内容累积，长度={len(reasoning_content)}, include_reasoning={include_reasoning}")
-                            if include_reasoning and not has_sent_reasoning and reasoning_content:
-                                # 发送思考内容（作为单独的消息）
+                        if text_type == 'thinking':
+                            # 累积思考内容
+                            accumulated_thinking += content
+                            logger.debug(f"[流式处理] 思考内容累积，总长度={len(accumulated_thinking)}")
+
+                            # 如果 include_reasoning=true，发送思考内容
+                            if include_reasoning:
                                 reasoning_chunk = {
                                     "id": request_id,
                                     "object": "chat.completion.chunk",
@@ -307,45 +308,35 @@ class NotionAIProvider(BaseProvider):
                                     "choices": [{
                                         "index": 0,
                                         "delta": {
-                                            "reasoning_content": reasoning_content
+                                            "content": content  # 直接作为普通内容发送
                                         },
                                         "finish_reason": None
                                     }]
                                 }
-                                logger.info(f"[流式处理] 发送思考内容块，长度={len(reasoning_content)}")
+                                logger.info(f"[发送思考内容] 长度={len(content)}, 内容: {content[:100]}...")
                                 yield create_sse_data(reasoning_chunk)
-                                has_sent_reasoning = True
 
-                    # 实时增量发送新内容
-                    if len(accumulated_content) > sent_content_length:
-                        # 关键改变：对累积的完整内容进行清洗，然后只发送新增的部分
-                        # include_reasoning 控制是否移除思考内容
-                        remove_thinking = not include_reasoning
-                        cleaned_full_content = self._clean_content(accumulated_content, remove_thinking=remove_thinking)
+                        elif text_type == 'final' or text_type == 'incremental':
+                            # 累积文本内容
+                            if text_type == 'final':
+                                accumulated_content = content
+                                logger.debug(f"[流式处理] 文本内容更新为完整内容，长度={len(accumulated_content)}")
+                            else:  # incremental
+                                accumulated_content += content
+                                logger.debug(f"[流式处理] 文本内容增加，新长度={len(accumulated_content)}")
 
-                        # 计算已发送的清洗后内容长度（通过清洗之前发送的部分）
-                        if sent_content_length > 0:
-                            cleaned_sent_content = self._clean_content(accumulated_content[:sent_content_length], remove_thinking=remove_thinking)
-                            cleaned_sent_length = len(cleaned_sent_content)
-                        else:
-                            cleaned_sent_length = 0
+                            # 发送新增的文本内容
+                            if len(accumulated_content) > sent_content_length:
+                                new_content = accumulated_content[sent_content_length:]
+                                logger.info(f"[发送文本内容] 长度={len(new_content)}, 内容: {new_content[:100]}...")
 
-                        # 提取新的清洗后内容
-                        if len(cleaned_full_content) > cleaned_sent_length:
-                            cleaned_new_content = cleaned_full_content[cleaned_sent_length:]
-                            logger.debug(f"[流式处理] 清洗后新内容长度={len(cleaned_new_content)}, 原始长度={len(accumulated_content) - sent_content_length}, remove_thinking={remove_thinking}")
-
-                            if cleaned_new_content:
-                                logger.info(f"[发送给客户端] 内容: {cleaned_new_content[:100]}...")
                                 chunk = create_chat_completion_chunk(
                                     request_id,
                                     model_name,
-                                    content=cleaned_new_content
+                                    content=new_content
                                 )
                                 yield create_sse_data(chunk)
-
-                        sent_content_length = len(accumulated_content)
-                        logger.debug(f"[流式处理] 更新已发送原始内容长度={sent_content_length}")
+                                sent_content_length = len(accumulated_content)
 
                 # 发送完成标志
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
@@ -592,26 +583,39 @@ class NotionAIProvider(BaseProvider):
                     path = operation.get("p", "")
                     value = operation.get("v")
 
-                    # Gemini 的完整内容 patch 格式
-                    if op_type == "a" and path.endswith("/s/-") and isinstance(value, dict) and value.get("type") == "markdown-chat":
-                        content = value.get("value", "")
-                        if content:
-                            logger.debug("从 'patch' (Gemini-style) 中提取到完整内容。")
-                            # 提取思考内容
-                            thinking = self._extract_thinking_content(content)
-                            if thinking:
-                                results.append(('thinking', thinking))
-                            results.append(('final', content))
+                    # 关键修复：检查 value 中的 type 字段来区分 thinking 和 text
+                    if op_type == "a" and path.endswith("/s/-") and isinstance(value, dict):
+                        value_type = value.get("type")
 
-                    # Gemini 的增量内容 patch 格式
+                        # agent-inference 类型，包含 thinking 或 text
+                        if value_type == "agent-inference":
+                            agent_values = value.get("value", [])
+                            if isinstance(agent_values, list):
+                                for item in agent_values:
+                                    if isinstance(item, dict):
+                                        item_type = item.get("type")
+                                        content = item.get("content", "")
+
+                                        if content:
+                                            if item_type == "thinking":
+                                                logger.debug(f"从 patch 中提取到思考内容: {content[:100]}...")
+                                                results.append(('thinking', content))
+                                            elif item_type == "text":
+                                                logger.debug(f"从 patch 中提取到文本内容: {content[:100]}...")
+                                                results.append(('incremental', content))
+
+                        # markdown-chat 类型（Gemini）
+                        elif value_type == "markdown-chat":
+                            content = value.get("value", "")
+                            if content:
+                                logger.debug("从 'patch' (Gemini-style) 中提取到完整内容。")
+                                results.append(('final', content))
+
+                    # 增量文本内容追加（Gemini）
                     elif op_type == "x" and "/s/" in path and path.endswith("/value") and isinstance(value, str):
                         content = value
                         if content:
                             logger.debug(f"从 'patch' (Gemini增量) 中提取到内容片段")
-                            # 增量内容也可能包含思考标签
-                            thinking = self._extract_thinking_content(content)
-                            if thinking:
-                                results.append(('thinking', thinking))
                             results.append(('incremental', content))
 
                     # Claude 和 GPT 的增量内容 patch 格式
@@ -619,20 +623,20 @@ class NotionAIProvider(BaseProvider):
                         content = value
                         if content:
                             logger.debug(f"从 'patch' (Claude/GPT增量) 中提取到内容片段")
-                            thinking = self._extract_thinking_content(content)
-                            if thinking:
-                                results.append(('thinking', thinking))
                             results.append(('incremental', content))
 
-                    # Claude 和 GPT 的完整内容 patch 格式
-                    elif op_type == "a" and path.endswith("/value/-") and isinstance(value, dict) and value.get("type") == "text":
+                    # 追加到 value 数组的情况（通常是文本内容）
+                    elif op_type == "a" and path.endswith("/value/-") and isinstance(value, dict):
+                        item_type = value.get("type")
                         content = value.get("content", "")
+
                         if content:
-                            logger.debug("从 'patch' (Claude/GPT-style) 中提取到完整内容。")
-                            thinking = self._extract_thinking_content(content)
-                            if thinking:
-                                results.append(('thinking', thinking))
-                            results.append(('final', content))
+                            if item_type == "thinking":
+                                logger.debug(f"从 value/- 中提取到思考内容: {content[:100]}...")
+                                results.append(('thinking', content))
+                            elif item_type == "text":
+                                logger.debug(f"从 value/- 中提取到文本内容: {content[:100]}...")
+                                results.append(('incremental', content))
 
             # 格式3: 处理record-map类型的数据
             elif data.get("type") == "record-map" and "recordMap" in data:
