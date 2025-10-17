@@ -195,14 +195,18 @@ class NotionAIProvider(BaseProvider):
             # include_reasoning 控制是否包含思考内容
             include_reasoning = request_data.get("include_reasoning", False)
 
+            # 构建响应消息
+            message_content = {
+                "role": "assistant",
+                "content": full_content
+            }
+
+            # 如果需要包含思考内容，使用 reasoning_content 字段
             if include_reasoning and thinking_fragments:
-                # 如果需要包含思考内容，将其添加到回答前面
                 thinking_content = "".join(thinking_fragments)
-                final_content = thinking_content + full_content
+                message_content["reasoning_content"] = thinking_content
                 logger.info(f"非流式请求完成，include_reasoning=True, 思考内容长度={len(thinking_content)}, 回答长度={len(full_content)}")
             else:
-                # 否则只返回回答内容
-                final_content = full_content
                 logger.info(f"非流式请求完成，include_reasoning=False, 回答长度={len(full_content)}")
 
             # 返回标准 OpenAI 格式响应
@@ -213,10 +217,7 @@ class NotionAIProvider(BaseProvider):
                 "model": model_name,
                 "choices": [{
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": final_content
-                    },
+                    "message": message_content,
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -298,7 +299,7 @@ class NotionAIProvider(BaseProvider):
                             accumulated_thinking += content
                             logger.debug(f"[流式处理] 思考内容累积，总长度={len(accumulated_thinking)}")
 
-                            # 如果 include_reasoning=true，发送思考内容
+                            # 如果 include_reasoning=true，使用 reasoning_content 字段发送
                             if include_reasoning:
                                 reasoning_chunk = {
                                     "id": request_id,
@@ -308,12 +309,12 @@ class NotionAIProvider(BaseProvider):
                                     "choices": [{
                                         "index": 0,
                                         "delta": {
-                                            "content": content  # 直接作为普通内容发送
+                                            "reasoning_content": content  # 使用专用字段
                                         },
                                         "finish_reason": None
                                     }]
                                 }
-                                logger.info(f"[发送思考内容] 长度={len(content)}, 内容: {content[:100]}...")
+                                logger.info(f"[发送思考内容] 使用 reasoning_content 字段，长度={len(content)}")
                                 yield create_sse_data(reasoning_chunk)
 
                         elif text_type == 'final' or text_type == 'incremental':
