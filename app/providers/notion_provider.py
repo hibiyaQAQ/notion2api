@@ -299,10 +299,7 @@ class NotionAIProvider(BaseProvider):
                 yield create_sse_data(error_chunk)
                 yield DONE_CHUNK
 
-        if stream:
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
-        else:
-            raise HTTPException(status_code=400, detail="此端点当前仅支持流式响应 (stream=true)。")
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
     def _prepare_headers(self) -> Dict[str, str]:
         cookie_source = (settings.NOTION_COOKIE or "").strip()
@@ -530,3 +527,4 @@ class NotionAIProvider(BaseProvider):
             ]
         }
         return JSONResponse(content=model_data)
+
